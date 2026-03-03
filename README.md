@@ -59,7 +59,7 @@
 ### Install & Run (auto-installs all dependencies)
 
 ```bash
-git clone https://github.com/yourusername/3eye.git
+git clone https://github.com/2122Adi/3eye.git
 cd 3eye
 python 3eye.py
 ```
@@ -111,7 +111,7 @@ usage: 3eye.py [-h] [--output OUTPUT] [--skip-ports] [--skip-paths]
                [--skip-wayback] [--quick] [url]
 
 positional arguments:
-  url                   Target URL (default: https://testuser.joterp.online/login)
+  url                   Target URL (default: https://testuser.xyz.com/login)
 
 options:
   -h, --help            show this help message and exit
