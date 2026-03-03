@@ -16,7 +16,7 @@
      ██║   ██║  ██║███████╗   ██║   ███████╗
      ╚═╝   ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝
 
-        👁  3 E Y E  v2.0  —  by Aditya Bhosale
+        👁  3 E Y E  v1.0  —  by Aditya Bhosale
      Advanced VAPT Web Recon — 100% Free & Open Source
 ```
 
