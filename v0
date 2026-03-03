@@ -1,0 +1,1106 @@
+#!/usr/bin/env python3
+"""
+██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗
+██╔══██╗██╔════╝██╔════╝██╔═══██╗████╗  ██║
+██████╔╝█████╗  ██║     ██║   ██║██╔██╗ ██║
+██╔══██╗██╔══╝  ██║     ██║   ██║██║╚██╗██║
+██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║
+╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝
+  VAPT Web Recon — 100% Free & Open Source
+  Target: https://testuser.joterp.online/login
+═══════════════════════════════════════════════
+  Use ONLY on targets you own or have written
+  permission to test. Passive recon only.
+═══════════════════════════════════════════════
+"""
+
+import sys, os, re, ssl, json, time, socket, hashlib
+import urllib.parse, datetime, argparse, ipaddress
+import http.client
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ── Dependency check & install ─────────────────────────────────────────────
+REQUIRED = ["requests", "bs4", "dnspython", "whois", "builtwith"]
+
+def install_missing():
+    import importlib, subprocess
+    mapping = {
+        "bs4": "beautifulsoup4",
+        "dnspython": "dnspython",
+        "whois": "python-whois",
+        "builtwith": "builtwith",
+        "requests": "requests",
+    }
+    for mod in REQUIRED:
+        try:
+            importlib.import_module(mod)
+        except ImportError:
+            pkg = mapping.get(mod, mod)
+            print(f"[*] Installing {pkg}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install",
+                                   pkg, "--break-system-packages", "-q"])
+
+install_missing()
+
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+from bs4 import BeautifulSoup
+import dns.resolver
+import whois as whois_lib
+
+try:
+    import builtwith as bw_lib
+    BW_AVAILABLE = True
+except Exception:
+    BW_AVAILABLE = False
+
+# ── Config ──────────────────────────────────────────────────────────────────
+DEFAULT_TARGET = "http://testphp.vulnweb.com/#/popular"
+TIMEOUT        = 12
+MAX_WORKERS    = 15
+UA             = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+
+# ── Colors ───────────────────────────────────────────────────────────────────
+class C:
+    RED    = "\033[91m"; ORANGE = "\033[93m"; GREEN  = "\033[92m"
+    BLUE   = "\033[94m"; CYAN   = "\033[96m"; PURPLE = "\033[95m"
+    BOLD   = "\033[1m";  DIM    = "\033[2m";  RESET  = "\033[0m"
+    UNDER  = "\033[4m"
+
+SEV_ICON = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","LOW":"🔵","INFO":"⚪","GOOD":"✅"}
+SEV_COL  = {"CRITICAL":C.RED,"HIGH":C.ORANGE,"MEDIUM":C.ORANGE,
+            "LOW":C.BLUE,"INFO":C.DIM,"GOOD":C.GREEN}
+
+# ── Findings ─────────────────────────────────────────────────────────────────
+all_findings = []
+
+def find(category, severity, title, detail="", rec=""):
+    all_findings.append(dict(category=category, severity=severity,
+                             title=title, detail=detail, rec=rec))
+    icon  = SEV_ICON.get(severity, "⚪")
+    color = SEV_COL.get(severity, C.RESET)
+    print(f"  {icon} {color}{C.BOLD}[{severity}]{C.RESET} {title}")
+    if detail:
+        for line in str(detail).splitlines()[:4]:
+            print(f"      {C.DIM}{line}{C.RESET}")
+    if rec:
+        print(f"      {C.GREEN}→ {rec}{C.RESET}")
+
+def section(title):
+    print(f"\n{C.CYAN}{C.BOLD}{'─'*55}")
+    print(f"  {title}")
+    print(f"{'─'*55}{C.RESET}")
+
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
+def session():
+    s = requests.Session()
+    s.headers["User-Agent"] = UA
+    return s
+
+def get(s, url, **kw):
+    try:
+        return s.get(url, timeout=TIMEOUT, verify=False,
+                     allow_redirects=True, **kw)
+    except Exception:
+        return None
+
+def head(s, url, **kw):
+    try:
+        return s.head(url, timeout=TIMEOUT, verify=False,
+                      allow_redirects=True, **kw)
+    except Exception:
+        return None
+
+# ══════════════════════════════════════════════════════
+#  1. DNS — A, AAAA, MX, NS, TXT, CNAME, SOA, SPF, DMARC
+# ══════════════════════════════════════════════════════
+def recon_dns(host):
+    section("1 · DNS ENUMERATION")
+    record_types = ["A","AAAA","MX","NS","TXT","CNAME","SOA","SRV","CAA"]
+
+    for rtype in record_types:
+        try:
+            answers = dns.resolver.resolve(host, rtype, lifetime=6)
+            vals = [str(r) for r in answers]
+            find("DNS", "INFO", f"DNS {rtype} records", "\n".join(vals))
+        except dns.resolver.NXDOMAIN:
+            find("DNS","INFO","Domain does not exist (NXDOMAIN)","")
+            break
+        except Exception:
+            pass
+
+    # SPF check
+    try:
+        spf_found = False
+        for r in dns.resolver.resolve(host, "TXT", lifetime=6):
+            val = str(r)
+            if "v=spf1" in val:
+                spf_found = True
+                find("DNS","GOOD","SPF record found", val)
+                if "+all" in val:
+                    find("DNS","CRITICAL","SPF uses +all (allows anyone to send)",val,
+                         "Change +all to ~all or -all immediately.")
+        if not spf_found:
+            find("DNS","MEDIUM","No SPF record — email spoofing possible","",
+                 "Add a TXT SPF record: v=spf1 include:... -all")
+    except Exception:
+        pass
+
+    # DMARC
+    try:
+        for r in dns.resolver.resolve(f"_dmarc.{host}", "TXT", lifetime=6):
+            val = str(r)
+            if "v=DMARC1" in val:
+                find("DNS","GOOD","DMARC record found", val)
+                if "p=none" in val:
+                    find("DNS","MEDIUM","DMARC policy is 'none' (no enforcement)",val,
+                         "Change DMARC policy to p=quarantine or p=reject.")
+    except Exception:
+        find("DNS","MEDIUM","No DMARC record found","",
+             "Add _dmarc TXT record: v=DMARC1; p=reject; rua=mailto:...")
+
+    # DNSSEC
+    try:
+        dns.resolver.resolve(host, "DNSKEY", lifetime=6)
+        find("DNS","GOOD","DNSSEC enabled","")
+    except Exception:
+        find("DNS","LOW","DNSSEC not detected","",
+             "Consider enabling DNSSEC for DNS integrity.")
+
+    # Zone transfer attempt (harmless probe)
+    try:
+        ns_records = dns.resolver.resolve(host, "NS", lifetime=6)
+        for ns in ns_records:
+            ns_host = str(ns).rstrip(".")
+            try:
+                z = dns.zone.from_xfr(dns.query.xfr(ns_host, host, timeout=4))
+                names = [str(n) for n in z.nodes.keys()]
+                find("DNS","CRITICAL",
+                     f"Zone transfer ALLOWED on {ns_host}",
+                     "\n".join(names[:20]),
+                     "Disable AXFR on all nameservers immediately.")
+            except Exception:
+                find("DNS","GOOD",f"Zone transfer denied by {ns_host}","")
+    except Exception:
+        pass
+
+    # Subdomains via DNS brute (small list, passive)
+    sub_wordlist = [
+        "www","mail","ftp","admin","api","dev","staging","test","beta","app",
+        "portal","vpn","remote","cdn","static","media","blog","shop","store",
+        "dashboard","login","secure","mx","smtp","pop","imap","webmail",
+        "support","help","docs","status","monitor","jenkins","gitlab","jira",
+    ]
+    section("1b · SUBDOMAIN BRUTEFORCE (DNS)")
+    found_subs = []
+    def check_sub(sub):
+        fqdn = f"{sub}.{host}"
+        try:
+            dns.resolver.resolve(fqdn, "A", lifetime=4)
+            return fqdn
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        for result in ex.map(check_sub, sub_wordlist):
+            if result:
+                found_subs.append(result)
+                find("DNS","HIGH",f"Subdomain found: {result}","",
+                     "Ensure this subdomain is intentional and secured.")
+
+    if not found_subs:
+        print("  ✅ No common subdomains found via DNS brute")
+
+    return found_subs
+
+
+# ══════════════════════════════════════════════════════
+#  2. WHOIS
+# ══════════════════════════════════════════════════════
+def recon_whois(host):
+    section("2 · WHOIS INFORMATION")
+    try:
+        w = whois_lib.whois(host)
+        fields = {
+            "Registrar"        : w.registrar,
+            "Creation Date"    : w.creation_date,
+            "Expiration Date"  : w.expiration_date,
+            "Updated Date"     : w.updated_date,
+            "Name Servers"     : w.name_servers,
+            "Status"           : w.status,
+            "Emails"           : w.emails,
+            "Org"              : w.org,
+            "Country"          : w.country,
+            "DNSSEC"           : w.dnssec,
+        }
+        for k, v in fields.items():
+            if v:
+                val = v if isinstance(v, str) else (
+                    ", ".join(str(x) for x in v) if isinstance(v, list) else str(v))
+                find("WHOIS","INFO", f"{k}: {val[:120]}","")
+
+        # Expiry warning
+        exp = w.expiration_date
+        if exp:
+            if isinstance(exp, list): exp = exp[0]
+            days = (exp - datetime.datetime.now()).days
+            if days < 0:
+                find("WHOIS","CRITICAL","Domain has EXPIRED","",
+                     "Renew domain immediately.")
+            elif days < 30:
+                find("WHOIS","HIGH",f"Domain expires in {days} days","",
+                     "Renew domain before expiry.")
+            elif days < 90:
+                find("WHOIS","MEDIUM",f"Domain expires in {days} days","")
+
+        # Privacy / registrant exposure
+        if w.emails:
+            emails = w.emails if isinstance(w.emails, list) else [w.emails]
+            for email in emails:
+                if email and "@" in email and "privacy" not in email.lower():
+                    find("WHOIS","LOW",f"Registrant email exposed: {email}","",
+                         "Enable WHOIS privacy protection.")
+    except Exception as e:
+        find("WHOIS","INFO",f"WHOIS lookup failed: {e}","")
+
+
+# ══════════════════════════════════════════════════════
+#  3. IP & GEOLOCATION (ip-api.com free tier)
+# ══════════════════════════════════════════════════════
+def recon_ip(host, s):
+    section("3 · IP / GEO / ASN / HOSTING")
+    try:
+        ip = socket.gethostbyname(host)
+        find("IP","INFO",f"Resolved IP: {ip}","")
+
+        # ip-api.com (free, no key needed, 45req/min)
+        r = get(s, f"http://ip-api.com/json/{ip}?fields=status,country,regionName,"
+                   f"city,org,as,isp,proxy,hosting,reverse")
+        if r and r.status_code == 200:
+            d = r.json()
+            find("IP","INFO","Geolocation",
+                 f"Country: {d.get('country')} | Region: {d.get('regionName')} | City: {d.get('city')}")
+            find("IP","INFO","Hosting / ISP",
+                 f"ISP: {d.get('isp')} | Org: {d.get('org')} | AS: {d.get('as')}")
+            if d.get("proxy"):
+                find("IP","MEDIUM","IP flagged as proxy/VPN by ip-api","")
+            if d.get("hosting"):
+                find("IP","INFO","Hosted on datacenter / cloud infrastructure","")
+            rev = d.get("reverse","")
+            if rev:
+                find("IP","INFO",f"Reverse DNS: {rev}","")
+
+        # Shodan InternetDB (free, no key needed)
+        r2 = get(s, f"https://internetdb.shodan.io/{ip}")
+        if r2 and r2.status_code == 200:
+            d2 = r2.json()
+            ports = d2.get("ports", [])
+            vulns = d2.get("vulns", [])
+            tags  = d2.get("tags", [])
+            cpes  = d2.get("cpes", [])
+
+            if ports:
+                find("IP","HIGH",f"Open ports (Shodan): {ports}","",
+                     "Close unnecessary ports, use firewall rules.")
+            if vulns:
+                for v in vulns:
+                    find("IP","CRITICAL",f"Known CVE on this IP: {v}","",
+                         f"Patch immediately: https://nvd.nist.gov/vuln/detail/{v}")
+            if cpes:
+                find("IP","MEDIUM","Software fingerprints (CPE)",
+                     "\n".join(cpes[:10]))
+            if tags:
+                find("IP","INFO",f"Shodan tags: {', '.join(tags)}","")
+
+        # BGP/ASN via bgpview (free)
+        r3 = get(s, f"https://api.bgpview.io/ip/{ip}")
+        if r3 and r3.status_code == 200:
+            d3 = r3.json()
+            data = d3.get("data", {})
+            prefixes = data.get("prefixes", [])
+            for p in prefixes[:3]:
+                asn = p.get("asn",{})
+                find("IP","INFO",
+                     f"BGP Prefix: {p.get('prefix')} | ASN: {asn.get('asn')} | {asn.get('name','')}")
+
+    except Exception as e:
+        find("IP","INFO",f"IP recon error: {e}","")
+
+
+# ══════════════════════════════════════════════════════
+#  4. SSL / TLS DEEP ANALYSIS
+# ══════════════════════════════════════════════════════
+def recon_ssl(host, port=443):
+    section("4 · SSL / TLS DEEP ANALYSIS")
+    try:
+        # Basic cert via ssl module
+        ctx = ssl.create_default_context()
+        with ctx.wrap_socket(socket.create_connection((host, port), timeout=TIMEOUT),
+                             server_hostname=host) as sock:
+            cert   = sock.getpeercert()
+            cipher = sock.cipher()
+            proto  = sock.version()
+
+            find("SSL","INFO",f"Protocol: {proto} | Cipher: {cipher[0]} | Bits: {cipher[2]}","")
+
+            if proto in ("SSLv2","SSLv3","TLSv1","TLSv1.1"):
+                find("SSL","CRITICAL",f"Outdated protocol: {proto}","",
+                     "Disable TLS 1.0/1.1, enforce TLS 1.2+")
+
+            if cipher[2] and cipher[2] < 128:
+                find("SSL","HIGH",f"Weak cipher key size: {cipher[2]} bits","",
+                     "Use 256-bit ciphers.")
+
+            # Cert expiry
+            exp_str = cert.get("notAfter","")
+            if exp_str:
+                exp  = datetime.datetime.strptime(exp_str, "%b %d %H:%M:%S %Y %Z")
+                days = (exp - datetime.datetime.utcnow()).days
+                sev  = "CRITICAL" if days < 0 else ("HIGH" if days < 14 else
+                        "MEDIUM" if days < 30 else "GOOD")
+                msg  = "EXPIRED" if days < 0 else f"Expires in {days} days"
+                find("SSL", sev, f"Certificate: {msg}", exp_str)
+
+            # Subject / issuer
+            subj   = dict(x[0] for x in cert.get("subject",[]))
+            issuer = dict(x[0] for x in cert.get("issuer",[]))
+            find("SSL","INFO",f"Subject CN: {subj.get('commonName','')}","")
+            find("SSL","INFO",f"Issuer: {issuer.get('organizationName','')}","")
+
+            if subj == issuer:
+                find("SSL","HIGH","Self-signed certificate","",
+                     "Use cert from trusted CA.")
+
+            # SAN
+            sans = cert.get("subjectAltName",[])
+            if sans:
+                san_vals = [v for t,v in sans]
+                find("SSL","INFO","Subject Alt Names (SANs)",
+                     ", ".join(san_vals[:15]))
+                # Wildcard
+                for v in san_vals:
+                    if v.startswith("*."):
+                        find("SSL","LOW",f"Wildcard cert: {v}","",
+                             "Wildcards increase blast radius if key is compromised.")
+
+        # Test weak protocols (by attempting connection with older ctx)
+        for proto_name, proto_const in [
+            ("TLSv1",   ssl.TLSVersion.TLSv1  if hasattr(ssl,"TLSVersion") else None),
+            ("TLSv1.1", ssl.TLSVersion.TLSv1_1 if hasattr(ssl,"TLSVersion") else None),
+        ]:
+            if proto_const is None:
+                continue
+            try:
+                ctx2 = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx2.check_hostname = False
+                ctx2.verify_mode    = ssl.CERT_NONE
+                ctx2.minimum_version = proto_const
+                ctx2.maximum_version = proto_const
+                with ctx2.wrap_socket(
+                    socket.create_connection((host, port), timeout=5),
+                    server_hostname=host):
+                    find("SSL","HIGH",f"Server accepts {proto_name}","",
+                         f"Disable {proto_name} in server config.")
+            except Exception:
+                find("SSL","GOOD",f"Server rejects {proto_name}","")
+
+        # Check via crt.sh (certificate transparency)
+        s_tmp = session()
+        r = get(s_tmp, f"https://crt.sh/?q={host}&output=json")
+        if r and r.status_code == 200:
+            try:
+                certs = r.json()
+                unique = {c["name_value"] for c in certs}
+                find("SSL","INFO",
+                     f"Certificate Transparency: {len(certs)} cert records, "
+                     f"{len(unique)} unique names",
+                     "\n".join(list(unique)[:15]))
+                # Extra subdomains from CT
+                subs = [n for n in unique if host in n and n != host and "*" not in n]
+                if subs:
+                    find("SSL","HIGH",
+                         f"CT logs reveal {len(subs)} subdomains",
+                         "\n".join(sorted(set(subs))[:20]),
+                         "Ensure all subdomains are intentional and secured.")
+            except Exception:
+                pass
+
+    except ConnectionRefusedError:
+        find("SSL","INFO","Port 443 not open","")
+    except Exception as e:
+        find("SSL","INFO",f"SSL analysis error: {e}","")
+
+
+# ══════════════════════════════════════════════════════
+#  5. HTTP HEADERS & SERVER FINGERPRINT
+# ══════════════════════════════════════════════════════
+SECURITY_HEADERS = {
+    "Strict-Transport-Security": ("HIGH",  "Add HSTS: max-age=31536000; includeSubDomains"),
+    "Content-Security-Policy":   ("HIGH",  "Define CSP to prevent XSS."),
+    "X-Frame-Options":           ("MEDIUM","Add X-Frame-Options: DENY"),
+    "X-Content-Type-Options":    ("MEDIUM","Add X-Content-Type-Options: nosniff"),
+    "Referrer-Policy":           ("LOW",   "Add Referrer-Policy: strict-origin-when-cross-origin"),
+    "Permissions-Policy":        ("LOW",   "Add Permissions-Policy header."),
+    "X-XSS-Protection":          ("LOW",   "Add X-XSS-Protection: 1; mode=block"),
+    "Cross-Origin-Opener-Policy":("LOW",   "Add COOP: same-origin"),
+    "Cross-Origin-Resource-Policy":("LOW", "Add CORP: same-origin"),
+}
+INFO_HEADERS = ["Server","X-Powered-By","X-AspNet-Version","X-AspNetMvc-Version",
+                "X-Generator","X-Runtime","X-Version","Via","X-Drupal-Cache",
+                "X-Pingback","X-CF-Powered-By","X-Litespeed-Cache"]
+
+def recon_headers(s, url):
+    section("5 · HTTP HEADERS & SERVER FINGERPRINT")
+    r = get(s, url)
+    if not r:
+        print("  [!] Could not fetch page"); return
+
+    headers = {k.lower(): v for k, v in r.headers.items()}
+
+    find("Headers","INFO",f"HTTP Status: {r.status_code} | Final URL: {r.url}","")
+    find("Headers","INFO",f"Response size: {len(r.content)} bytes","")
+
+    for h, (sev, rec) in SECURITY_HEADERS.items():
+        if h.lower() not in headers:
+            find("Headers", sev, f"Missing: {h}", "", rec)
+        else:
+            val = headers[h.lower()]
+            # Extra checks
+            if h == "Content-Security-Policy":
+                issues = []
+                if "unsafe-inline" in val: issues.append("unsafe-inline")
+                if "unsafe-eval"   in val: issues.append("unsafe-eval")
+                if "*"             in val: issues.append("wildcard *")
+                if issues:
+                    find("Headers","MEDIUM",f"CSP has weak directives: {', '.join(issues)}",
+                         val, "Remove unsafe directives from CSP.")
+            if h == "Strict-Transport-Security":
+                if "max-age" not in val.lower():
+                    find("Headers","MEDIUM","HSTS missing max-age",val)
+                else:
+                    age = re.search(r"max-age=(\d+)", val)
+                    if age and int(age.group(1)) < 15552000:
+                        find("Headers","LOW","HSTS max-age too short (<180 days)",val,
+                             "Use max-age=31536000 minimum.")
+
+    for h in INFO_HEADERS:
+        if h.lower() in headers:
+            find("Headers","MEDIUM",f"Server fingerprint leaked — {h}: {headers[h.lower()]}",
+                 "", f"Remove/obscure '{h}' header.")
+
+    # Cookie flags
+    for sc in r.headers.get("Set-Cookie","").split(","):
+        if not sc.strip(): continue
+        issues = []
+        if "secure"   not in sc.lower(): issues.append("missing Secure")
+        if "httponly" not in sc.lower(): issues.append("missing HttpOnly")
+        if "samesite" not in sc.lower(): issues.append("missing SameSite")
+        if issues:
+            name = sc.strip().split("=")[0]
+            find("Headers","HIGH",f"Cookie '{name}' insecure flags",
+                 ", ".join(issues),"Set Secure; HttpOnly; SameSite=Strict")
+
+    # CORS probe
+    r2 = get(s, url, headers={"Origin":"https://evil.example.com"})
+    if r2:
+        acao = r2.headers.get("Access-Control-Allow-Origin","")
+        acac = r2.headers.get("Access-Control-Allow-Credentials","")
+        if acao == "*":
+            find("Headers","MEDIUM","CORS: wildcard origin (*)",acao,
+                 "Restrict CORS to trusted origins.")
+        elif acao == "https://evil.example.com":
+            find("Headers","HIGH","CORS: reflects arbitrary origin",acao,
+                 "Validate Origin against allowlist.")
+        if acac.lower() == "true" and acao in ("*","https://evil.example.com"):
+            find("Headers","CRITICAL","CORS: credentials + permissive origin",
+                 f"{acao} / {acac}","Never combine credentials:true with wildcard.")
+
+    return r
+
+
+# ══════════════════════════════════════════════════════
+#  6. TECHNOLOGY FINGERPRINTING
+# ══════════════════════════════════════════════════════
+TECH_SIGS = {
+    # CMS
+    "WordPress":    [r"wp-content", r"wp-includes", r"/wp-json/"],
+    "Joomla":       [r"Joomla!", r"/components/com_"],
+    "Drupal":       [r"Drupal.settings", r"/sites/default/"],
+    "Magento":      [r"Mage.Cookies", r"var/cache/mage-"],
+    # Frameworks
+    "Laravel":      [r"laravel_session", r"XSRF-TOKEN"],
+    "Django":       [r"csrfmiddlewaretoken", r"django"],
+    "React":        [r"__NEXT_DATA__", r"react-dom", r"_react"],
+    "Vue.js":       [r"Vue.js", r"vue-router", r"__vue__"],
+    "Angular":      [r"ng-version", r"angular.min.js"],
+    "jQuery":       [r"jquery", r"jQuery"],
+    "Bootstrap":    [r"bootstrap.min.css", r"bootstrap.min.js"],
+    # Servers/infra
+    "Nginx":        [r"nginx"],
+    "Apache":       [r"Apache"],
+    "IIS":          [r"Microsoft-IIS"],
+    "Cloudflare":   [r"cf-ray", r"__cfduid", r"cloudflare"],
+    "AWS":          [r"amazonaws.com", r"aws-"],
+    "Google Cloud": [r"x-goog-", r"storage.googleapis"],
+    # Analytics
+    "Google Analytics": [r"google-analytics.com", r"gtag\(", r"UA-\d+"],
+    "Facebook Pixel":   [r"connect.facebook.net", r"fbq\("],
+    "Hotjar":           [r"hotjar.com", r"hjid"],
+    # Payment
+    "Stripe":   [r"js.stripe.com"],
+    "PayPal":   [r"paypal.com"],
+    # Security
+    "reCAPTCHA":   [r"recaptcha", r"g-recaptcha"],
+    "hCaptcha":    [r"hcaptcha.com"],
+    "Cloudflare Turnstile": [r"challenges.cloudflare.com"],
+}
+
+def recon_technologies(s, url):
+    section("6 · TECHNOLOGY FINGERPRINTING")
+    r = get(s, url)
+    if not r:
+        print("  [!] Could not fetch"); return
+
+    body    = r.text
+    h_lower = {k.lower(): v.lower() for k, v in r.headers.items()}
+    full    = body + " " + str(r.headers)
+    detected = []
+
+    for tech, patterns in TECH_SIGS.items():
+        for pat in patterns:
+            if re.search(pat, full, re.IGNORECASE):
+                detected.append(tech)
+                break
+
+    # Header-based
+    server = h_lower.get("server","")
+    xpow   = h_lower.get("x-powered-by","")
+    if server: find("Tech","INFO",f"Server header: {server}","")
+    if xpow:   find("Tech","MEDIUM",f"X-Powered-By: {xpow}","",
+                    "Remove X-Powered-By header.")
+
+    for t in detected:
+        find("Tech","INFO",f"Technology detected: {t}","")
+
+    # Meta generator
+    soup = BeautifulSoup(body, "html.parser")
+    gen  = soup.find("meta", attrs={"name":"generator"})
+    if gen:
+        find("Tech","MEDIUM",f"Meta generator tag: {gen.get('content','')}","",
+             "Remove meta generator tag — reveals CMS/version.")
+
+    # JS library versions in scripts
+    for script in soup.find_all("script", src=True):
+        src = script["src"]
+        ver = re.search(r"[\-/](\d+\.\d+[\.\d]*)", src)
+        if ver and any(k.lower() in src.lower()
+                       for k in ["jquery","react","vue","angular","lodash","moment"]):
+            find("Tech","LOW",f"JS lib version in URL: {src[-80:]}",ver.group(0),
+                 "Consider integrity checks (SRI) and keep libs updated.")
+
+    # builtwith (local heuristic, no API key)
+    if BW_AVAILABLE:
+        try:
+            bw = bw_lib.builtwith(url)
+            for cat, techs in bw.items():
+                find("Tech","INFO",f"BuiltWith [{cat}]", ", ".join(techs[:8]))
+        except Exception:
+            pass
+
+    # robots.txt / sitemap
+    for path in ["/robots.txt", "/sitemap.xml", "/sitemap_index.xml"]:
+        rr = get(s, url.rstrip("/").rsplit("/",1)[0] + path)
+        if rr and rr.status_code == 200:
+            find("Tech","INFO",f"Found: {path}",
+                 rr.text[:300])
+
+
+# ══════════════════════════════════════════════════════
+#  7. OPEN PORTS SCAN (TCP connect, common web ports)
+# ══════════════════════════════════════════════════════
+PORT_LIST = {
+    21:"FTP", 22:"SSH", 23:"Telnet", 25:"SMTP", 53:"DNS",
+    80:"HTTP", 110:"POP3", 143:"IMAP", 443:"HTTPS", 445:"SMB",
+    465:"SMTPS", 587:"SMTP Submission", 993:"IMAPS", 995:"POP3S",
+    1433:"MSSQL", 1521:"Oracle", 3306:"MySQL", 3389:"RDP",
+    5432:"PostgreSQL", 5900:"VNC", 6379:"Redis", 8000:"HTTP-alt",
+    8080:"HTTP-proxy", 8443:"HTTPS-alt", 8888:"HTTP-dev",
+    9200:"Elasticsearch", 27017:"MongoDB", 6443:"K8s API",
+}
+
+def check_port(host, port):
+    try:
+        with socket.create_connection((host, port), timeout=2):
+            return port, True
+    except Exception:
+        return port, False
+
+def recon_ports(host):
+    section("7 · PORT SCAN (common web/infra ports)")
+    open_ports = []
+
+    with ThreadPoolExecutor(max_workers=30) as ex:
+        futures = {ex.submit(check_port, host, p): p for p in PORT_LIST}
+        for f in as_completed(futures):
+            port, is_open = f.result()
+            if is_open:
+                service = PORT_LIST[port]
+                open_ports.append(port)
+                sev = "CRITICAL" if port in (23,) else \
+                      "HIGH"     if port in (21,3306,5432,27017,6379,9200,3389,5900,445) else \
+                      "MEDIUM"   if port in (22,1433,1521) else "INFO"
+                find("Ports", sev, f"Open port {port}/{service}","",
+                     f"Restrict port {port} to trusted IPs only." if sev in ("HIGH","CRITICAL") else "")
+
+    if not open_ports:
+        print("  ✅ No extra open ports detected")
+    return open_ports
+
+
+# ══════════════════════════════════════════════════════
+#  8. DIRECTORY & FILE ENUMERATION
+# ══════════════════════════════════════════════════════
+PATHS = [
+    # Config / secrets
+    "/.env","/.env.local","/.env.production","/.env.backup","/.env.example",
+    "/config.php","/config.yml","/config.yaml","/config.json","/configuration.php",
+    "/settings.py","/settings.php","/app/config.php","/application.properties",
+    "/database.yml","/db.php",
+    # CMS
+    "/wp-config.php","/wp-config.php.bak","/wp-config.php~",
+    "/wp-admin/","/wp-login.php","/wp-json/wp/v2/users",
+    "/xmlrpc.php","/readme.html","/license.txt",
+    # Admin
+    "/admin","/admin/","/administrator","/admin/login",
+    "/phpmyadmin","/pma","/dbadmin","/manager/html",
+    "/cp","/controlpanel","/dashboard","/cpanel","/webadmin",
+    # Backups
+    "/backup","/backup.zip","/backup.tar.gz","/backup.sql",
+    "/db_backup.sql","/dump.sql","/database.sql","/site.zip",
+    "/old","/old.zip","/.bak","/www.zip",
+    # Logs
+    "/logs","/log","/error.log","/access.log","/debug.log",
+    "/app.log","/laravel.log","/storage/logs/laravel.log",
+    "/var/log/nginx/error.log",
+    # VCS
+    "/.git/HEAD","/.git/config","/.git/COMMIT_EDITMSG",
+    "/.svn/entries","/.hg/hgrc","/.bzr/",
+    # Dev / debug
+    "/phpinfo.php","/info.php","/test.php","/debug",
+    "/_debug","/debug/pprof","/console","/shell",
+    "/.DS_Store","/.htaccess","/.htpasswd",
+    # API / docs
+    "/api","/api/v1","/api/v2","/api/v1/users","/api/v1/admin",
+    "/swagger","/swagger.json","/swagger-ui.html",
+    "/openapi.json","/api-docs","/graphql","/graphiql",
+    # Cloud / infra
+    "/.aws/credentials","/.docker/config.json",
+    "/server-status","/server-info","/nginx_status","/fpm-status",
+    # Misc
+    "/.well-known/security.txt","/.well-known/change-password",
+    "/security.txt","/crossdomain.xml","/clientaccesspolicy.xml",
+    "/package.json","/composer.json","/yarn.lock","/package-lock.json",
+    "/Gemfile","/requirements.txt","/.npmrc","/.yarnrc",
+    "/web.config","/applicationHost.config","/global.asax",
+    "/WEB-INF/web.xml","/META-INF/",
+]
+
+def check_path(s, base, path):
+    url = base.rstrip("/") + path
+    try:
+        r = s.get(url, timeout=TIMEOUT, verify=False,
+                  allow_redirects=False, headers={"User-Agent": UA})
+        return path, r.status_code, len(r.content), r.text[:200]
+    except Exception:
+        return path, 0, 0, ""
+
+def recon_paths(s, base_url):
+    section(f"8 · FILE & DIRECTORY ENUMERATION ({len(PATHS)} paths)")
+    found = []
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(check_path, s, base_url, p): p for p in PATHS}
+        for f in as_completed(futures):
+            path, status, size, preview = f.result()
+            if status in (200, 206, 401, 403):
+                note = {200:"ACCESSIBLE", 206:"PARTIAL", 401:"AUTH REQUIRED", 403:"FORBIDDEN"}[status]
+                sev  = "CRITICAL" if status == 200 and any(x in path for x in [
+                    ".env","wp-config",".git","credentials","backup","dump.sql",
+                    "phpinfo","config.php","database.sql"]) \
+                    else "HIGH" if status == 200 else \
+                    "MEDIUM" if status == 401 else "LOW"
+                find("Paths", sev, f"[{status} {note}] {path}",
+                     preview[:100] if status == 200 else "",
+                     "Remove or protect this resource." if sev in ("CRITICAL","HIGH") else "")
+                found.append(path)
+
+    if not found:
+        print("  ✅ No sensitive paths exposed")
+
+
+# ══════════════════════════════════════════════════════
+#  9. LOGIN PAGE DEEP ANALYSIS
+# ══════════════════════════════════════════════════════
+def recon_login(s, url):
+    section("9 · LOGIN PAGE DEEP ANALYSIS")
+    r = get(s, url)
+    if not r or r.status_code != 200:
+        print("  [!] Could not access login page"); return
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    body = r.text.lower()
+
+    # Forms analysis
+    forms = soup.find_all("form")
+    if not forms:
+        find("Login","INFO","No HTML forms found on page","")
+        return
+
+    find("Login","INFO",f"Found {len(forms)} form(s) on page","")
+
+    for i, form in enumerate(forms):
+        inputs = form.find_all("input")
+        action = form.get("action","")
+        method = form.get("method","get").lower()
+
+        find("Login","INFO",f"Form {i+1}: method={method.upper()} action={action}","")
+
+        if method == "get":
+            find("Login","HIGH","Login form uses GET — credentials visible in URL","",
+                 "Change form method to POST.")
+
+        if action.startswith("http://"):
+            find("Login","CRITICAL","Form submits credentials over HTTP","",
+                 "Change form action to HTTPS endpoint.")
+
+        # CSRF detection
+        csrf_names = ["csrf","csrf_token","_token","csrfmiddlewaretoken",
+                      "_csrf","authenticity_token","nonce","__requestverificationtoken"]
+        has_csrf = any(
+            inp.get("name","").lower() in csrf_names or
+            inp.get("id","").lower() in csrf_names
+            for inp in inputs
+        )
+        if has_csrf:
+            find("Login","GOOD","CSRF token present in form","")
+        else:
+            find("Login","HIGH","No CSRF token detected in login form","",
+                 "Implement CSRF protection on all state-changing forms.")
+
+        # Hidden fields (might be interesting)
+        for inp in inputs:
+            if inp.get("type","").lower() == "hidden":
+                name = inp.get("name","")
+                val  = inp.get("value","")[:80]
+                find("Login","INFO",f"Hidden field: {name}={val}","")
+
+        # Password field checks
+        for inp in inputs:
+            if inp.get("type","").lower() == "password":
+                if inp.get("autocomplete","").lower() not in ("off","new-password"):
+                    find("Login","LOW","Password field: autocomplete not disabled","",
+                         "Add autocomplete='off' to password inputs.")
+                if inp.get("minlength"):
+                    find("Login","INFO",f"Password minlength: {inp.get('minlength')}","")
+
+    # CAPTCHA
+    captcha_sigs = ["captcha","recaptcha","hcaptcha","turnstile","g-recaptcha","cf-turnstile"]
+    has_captcha  = any(sig in body for sig in captcha_sigs)
+    if has_captcha:
+        find("Login","GOOD","CAPTCHA detected — brute-force harder","")
+    else:
+        find("Login","MEDIUM","No CAPTCHA on login page","",
+             "Add CAPTCHA to prevent automated brute-force attacks.")
+
+    # Rate limiting headers
+    r2 = get(s, url)
+    if r2:
+        rl_headers = ["x-ratelimit-limit","retry-after","x-rate-limit",
+                      "ratelimit-limit","x-ratelimit-remaining"]
+        found_rl = [h for h in rl_headers if h in {k.lower() for k in r2.headers}]
+        if found_rl:
+            find("Login","GOOD",f"Rate-limit headers detected: {found_rl}","")
+        else:
+            find("Login","MEDIUM","No rate-limit headers visible","",
+                 "Implement server-side rate limiting and lockout.")
+
+    # Password reset link
+    if "forgot" in body or "reset" in body or "password" in body:
+        links = soup.find_all("a", href=True)
+        for a in links:
+            if any(k in a["href"].lower() for k in ["forgot","reset","recover"]):
+                find("Login","INFO",f"Password reset link: {a['href']}","",
+                     "Ensure reset tokens expire and are single-use.")
+
+    # Enumerate response differences (manual note)
+    find("Login","INFO",
+         "Manually test: submit invalid username vs valid username",
+         "Check if error messages differ — account enumeration risk.",
+         "Always return generic: 'Invalid username or password'.")
+
+
+# ══════════════════════════════════════════════════════
+#  10. EMAIL ADDRESSES & INFO DISCLOSURE (passive)
+# ══════════════════════════════════════════════════════
+def recon_emails(s, url):
+    section("10 · EMAIL / INFO DISCLOSURE")
+    r = get(s, url)
+    if not r: return
+
+    # Emails in page
+    emails = re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", r.text)
+    emails = [e for e in set(emails) if not e.endswith((".png","jpg","gif","css","js"))]
+    for e in emails[:20]:
+        find("Disclosure","MEDIUM",f"Email found in page source: {e}","",
+             "Remove emails from public HTML; use contact forms instead.")
+
+    # Phone numbers
+    phones = re.findall(r"[\+]?[\d\s\-\(\)]{10,15}", r.text)
+    if phones:
+        find("Disclosure","LOW",f"Possible phone numbers found ({len(phones)})","")
+
+    # IP addresses
+    ips = re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", r.text)
+    private_ips = [ip for ip in ips
+                   if re.match(r"^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)", ip)]
+    if private_ips:
+        find("Disclosure","HIGH",
+             f"Private/internal IPs in page source: {set(private_ips)}","",
+             "Remove internal IP references from public pages.")
+
+    # Comments with sensitive keywords
+    soup = BeautifulSoup(r.text, "html.parser")
+    comments = soup.find_all(string=lambda t: isinstance(t, type(t)) and
+                             hasattr(t, '__class__') and 'Comment' in type(t).__name__)
+    for c in comments:
+        text = str(c).strip()
+        if any(k in text.lower() for k in ["todo","fixme","hack","password","key","secret",
+                                            "api","token","bug","debug","admin"]):
+            find("Disclosure","MEDIUM",f"Sensitive HTML comment found",
+                 text[:120], "Remove developer comments from production HTML.")
+
+    # JS source hints
+    scripts = soup.find_all("script")
+    for sc in scripts:
+        if not sc.get("src"):
+            text = sc.string or ""
+            for pattern, label in [
+                (r"(?:api_key|apikey|api-key)\s*[:=]\s*['\"]([^'\"]{8,})['\"]", "API Key"),
+                (r"(?:secret|password|passwd|token)\s*[:=]\s*['\"]([^'\"]{6,})['\"]", "Secret/Token"),
+                (r"https?://(?:localhost|127\.0\.0\.1|192\.168\.|10\.)", "Internal URL"),
+            ]:
+                m = re.search(pattern, text, re.IGNORECASE)
+                if m:
+                    find("Disclosure","CRITICAL",
+                         f"Potential {label} in inline JS",
+                         m.group(0)[:100],
+                         "Move secrets to server-side; never embed in client JS.")
+
+
+# ══════════════════════════════════════════════════════
+#  11. WAYBACK MACHINE — HISTORICAL URLS
+# ══════════════════════════════════════════════════════
+def recon_wayback(s, host):
+    section("11 · WAYBACK MACHINE (Historical URLs)")
+    try:
+        url = (f"https://web.archive.org/cdx/search/cdx"
+               f"?url={host}/*&output=json&limit=200&fl=original,statuscode,timestamp"
+               f"&collapse=urlkey&filter=statuscode:200")
+        r = get(s, url)
+        if not r or r.status_code != 200:
+            print("  [!] Wayback unavailable"); return
+
+        data = r.json()
+        if len(data) <= 1:
+            print("  ⚪ No archived URLs found"); return
+
+        urls = [row[0] for row in data[1:]]
+        find("Wayback","INFO",f"Wayback Machine: {len(urls)} archived URLs","")
+
+        # Interesting paths in history
+        interesting = []
+        for u in urls:
+            p = urllib.parse.urlparse(u).path
+            if any(k in p.lower() for k in [
+                "admin","login","config","backup","api","debug","test",
+                "password","token","secret",".env","upload","shell",".php"
+            ]):
+                interesting.append(u)
+
+        if interesting:
+            find("Wayback","HIGH",
+                 f"{len(interesting)} historically interesting URLs found",
+                 "\n".join(interesting[:15]),
+                 "Check if old sensitive endpoints are still accessible.")
+
+        # Old file types
+        ext_map = {}
+        for u in urls:
+            ext = os.path.splitext(urllib.parse.urlparse(u).path)[1].lower()
+            if ext in (".php",".asp",".aspx",".jsp",".py",".rb",".sql",".zip",".bak",".log"):
+                ext_map[ext] = ext_map.get(ext, 0) + 1
+
+        if ext_map:
+            find("Wayback","MEDIUM","Historical file types",
+                 str(ext_map),
+                 "Verify old files/endpoints are removed or secured.")
+
+    except Exception as e:
+        find("Wayback","INFO",f"Wayback check failed: {e}","")
+
+
+# ══════════════════════════════════════════════════════
+#  12. GOOGLE DORKS (generate queries — manual)
+# ══════════════════════════════════════════════════════
+def generate_dorks(host):
+    section("12 · GOOGLE DORK QUERIES (run manually)")
+    base = host
+    dorks = [
+        f'site:{base} filetype:env',
+        f'site:{base} filetype:log',
+        f'site:{base} filetype:sql',
+        f'site:{base} filetype:bak',
+        f'site:{base} inurl:admin',
+        f'site:{base} inurl:login',
+        f'site:{base} inurl:config',
+        f'site:{base} "index of"',
+        f'site:{base} intext:"password"',
+        f'site:{base} intext:"api_key"',
+        f'site:{base} intext:"DB_PASSWORD"',
+        f'site:{base} ext:php intitle:"phpinfo()"',
+        f'site:{base} intitle:"Apache Status"',
+        f'"{base}" filetype:xls OR filetype:xlsx OR filetype:csv',
+        f'"{base}" "internal server error"',
+        f'cache:{base}',
+    ]
+    for d in dorks:
+        print(f"  {C.CYAN}{d}{C.RESET}")
+    find("Dorks","INFO",f"Generated {len(dorks)} Google dork queries",
+         "Run these manually in Google/Bing to find exposed sensitive data.")
+
+
+# ══════════════════════════════════════════════════════
+#  FINAL REPORT
+# ══════════════════════════════════════════════════════
+def print_report(target, elapsed):
+    counts = {}
+    for f in all_findings:
+        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+
+    score = (counts.get("CRITICAL",0)*10 + counts.get("HIGH",0)*5 +
+             counts.get("MEDIUM",0)*2 + counts.get("LOW",0)*1)
+
+    risk = ("🔴 CRITICAL" if score >= 30 else
+            "🟠 HIGH"     if score >= 15 else
+            "🟡 MEDIUM"   if score >= 5  else
+            "🟢 LOW")
+
+    print(f"\n{C.BOLD}{C.CYAN}{'═'*60}")
+    print(f"  VAPT RECON REPORT")
+    print(f"{'═'*60}{C.RESET}")
+    print(f"  Target    : {target}")
+    print(f"  Scanned   : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Duration  : {elapsed:.1f}s")
+    print(f"  Risk Score: {score}  →  {risk}")
+    print(f"{'─'*60}")
+    print(f"  {C.RED}Critical: {counts.get('CRITICAL',0)}{C.RESET}  "
+          f"{C.ORANGE}High: {counts.get('HIGH',0)}  "
+          f"Medium: {counts.get('MEDIUM',0)}{C.RESET}  "
+          f"{C.BLUE}Low: {counts.get('LOW',0)}{C.RESET}  "
+          f"{C.DIM}Info: {counts.get('INFO',0)}{C.RESET}  "
+          f"{C.GREEN}Good: {counts.get('GOOD',0)}{C.RESET}")
+    print(f"{'═'*60}\n")
+
+    for sev in ["CRITICAL","HIGH","MEDIUM","LOW","GOOD","INFO"]:
+        group = [f for f in all_findings if f["severity"] == sev]
+        if not group: continue
+        icon  = SEV_ICON[sev]
+        color = SEV_COL[sev]
+        print(f"{color}{C.BOLD}{icon} {sev} ({len(group)}){C.RESET}")
+        for f in group:
+            print(f"  [{f['category']}] {f['title']}")
+            if f["detail"] and sev in ("CRITICAL","HIGH"):
+                print(f"    {C.DIM}{str(f['detail'])[:100]}{C.RESET}")
+            if f["rec"]:
+                print(f"    {C.GREEN}Fix: {f['rec']}{C.RESET}")
+        print()
+
+
+def save_report(target, path):
+    report = {
+        "target"    : target,
+        "scanned_at": datetime.datetime.utcnow().isoformat()+"Z",
+        "total"     : len(all_findings),
+        "findings"  : all_findings,
+    }
+    with open(path,"w") as fh:
+        json.dump(report, fh, indent=2, default=str)
+    print(f"  💾 JSON report → {path}")
+
+
+# ══════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════
+def main():
+    parser = argparse.ArgumentParser(
+        description="VAPT Web Recon — 100% Free & Open Source",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="  Use ONLY on targets you own or have written permission to test.\n"
+    )
+    parser.add_argument("url", nargs="?", default=DEFAULT_TARGET,
+                        help=f"Target URL (default: {DEFAULT_TARGET})")
+    parser.add_argument("--output","-o", help="Save JSON report to file")
+    parser.add_argument("--skip-ports",   action="store_true")
+    parser.add_argument("--skip-paths",   action="store_true")
+    parser.add_argument("--skip-wayback", action="store_true")
+    args = parser.parse_args()
+
+    target = args.url
+    if not target.startswith(("http://","https://")):
+        target = "https://" + target
+
+    parsed = urllib.parse.urlparse(target)
+    host   = parsed.hostname
+    base   = f"{parsed.scheme}://{parsed.netloc}"
+
+    print(__doc__)
+    print(f"  Target : {C.BOLD}{target}{C.RESET}")
+    print(f"  Base   : {base}")
+    print(f"  Host   : {host}")
+    print(f"  Time   : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    s = session()
+    t0 = time.time()
+
+    recon_dns(host)
+    recon_whois(host)
+    recon_ip(host, s)
+    recon_ssl(host)
+    recon_headers(s, target)
+    recon_technologies(s, target)
+
+    if not args.skip_ports:
+        recon_ports(host)
+
+    if not args.skip_paths:
+        recon_paths(s, base)
+
+    recon_login(s, target)
+    recon_emails(s, target)
+
+    if not args.skip_wayback:
+        recon_wayback(s, host)
+
+    generate_dorks(host)
+    print_report(target, time.time() - t0)
+
+    if args.output:
+        save_report(target, args.output)
+    else:
+        save_report(target, f"recon_{host}_{int(time.time())}.json")
+
+
+if __name__ == "__main__":
+    main()
