@@ -205,7 +205,7 @@ MIT License — free to use, modify, and distribute with attribution.
 
 **Aditya Bhosale**
 
-- Tool: 3eye v2.0
+- Tool: 3eye v1.0
 - Purpose: VAPT Web Reconnaissance
 - Type: Passive / Detection only — no exploitation
 
